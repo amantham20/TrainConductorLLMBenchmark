@@ -41,6 +41,7 @@ function cloneState(prev) {
     ...prev,
     platforms: prev.platforms.map((p) => ({ ...p })),
     trains: prev.trains.map((t) => ({ ...t })),
+    switches: prev.switches.map((sw) => ({ ...sw })),
     log: [...prev.log],
     firedEvents: new Set(prev.firedEvents),
     conflictKeys: new Set(prev.conflictKeys),
@@ -117,8 +118,11 @@ export function initGame(scenario) {
     platforms: scenario.platforms.map((p) => ({ sigFail: false, ...p })),
     trains: scenario.trains.map((t) => ({
       delay: 0, blocked: false, blockNote: '', terminates: false,
-      holdMax: null, connPax: null, platId: null, actualDeparture: null, ...t,
+      holdMax: null, connPax: null, platId: null, actualDeparture: null, routeSet: false, ...t,
     })),
+    // Interlocking: a ladder of points (turnouts), one diverging to each platform.
+    // To reach platform k the operator lines turnouts 0..k-1 NORMAL and turnout k REVERSE.
+    switches: scenario.platforms.map((p, i) => ({ id: 'SW' + (i + 1), platIdx: i, platId: p.id, pos: 'N', locked: false, owner: null })),
     log: [],
     firedEvents: new Set(),
     conflictKeys: new Set(),
@@ -148,14 +152,18 @@ export function tickState(prev) {
         addLog(s, 'INFO', `${t.id} entering approach`)
       }
     } else if (t.status === 'APPROACHING') {
-      if (t.arr != null && s.time >= t.arr + t.delay && t.platId) {
+      // A train only proceeds when its route is SET — i.e. the operator has lined
+      // the points to a platform and the signal has cleared. Otherwise it is held.
+      if (t.arr != null && s.time >= t.arr + t.delay && t.platId && t.routeSet) {
         const plat = s.platforms.find((p) => p.id === t.platId)
         if (plat && plat.status === 'OCCUPIED' && plat.trainId && plat.trainId !== t.id) {
           registerConflict(s, `⚠ CONFLICT: ${t.id} reached ${plat.label} but it is occupied by ${plat.trainId}`, conflictKey(t.id, plat.trainId))
           // train stays APPROACHING
         } else if (plat) {
-          plat.status = 'OCCUPIED'; plat.trainId = t.id; t.status = 'AT_PLATFORM'
-          addLog(s, 'ARR', `▸ ${t.id} arrived at platform ${plat.label}`)
+          plat.status = 'OCCUPIED'; plat.trainId = t.id; t.status = 'AT_PLATFORM'; t.routeSet = false
+          // train has cleared the throat — release the points it held
+          s.switches.forEach((sw) => { if (sw.owner === t.id) { sw.locked = false; sw.owner = null } })
+          addLog(s, 'ARR', `▸ ${t.id} arrived at platform ${plat.label} — route normalised`)
           if (t.terminates) {
             t.status = 'DEPARTED'; t.actualDeparture = s.time
             plat.status = 'FREE'; plat.trainId = null
@@ -182,35 +190,96 @@ export function tickState(prev) {
   return s
 }
 
-// ── Player actions ───────────────────────────────────────────────────────────
-export function applyAssign(prev, trainId, platId) {
+// ── Interlocking helpers + player actions ────────────────────────────────────
+// The throat is a ladder of turnouts. The first turnout set to REVERSE peels the
+// route off the ladder onto its platform; turnouts before it must be NORMAL.
+export function linedDest(switches) {
+  const sw = switches.find((x) => x.pos === 'R')
+  return sw ? sw.platIdx : null
+}
+
+function releaseTrainRoute(s, trainId) {
+  s.switches.forEach((sw) => { if (sw.owner === trainId) { sw.locked = false; sw.owner = null } })
+}
+
+// Throw a single point (NORMAL ⇄ REVERSE). Rejected if locked under a set route.
+export function throwSwitch(prev, swId) {
+  const s = cloneState(prev)
+  const sw = s.switches.find((x) => x.id === swId)
+  if (!sw) return prev
+  if (sw.locked) {
+    addLog(s, 'ERR', `✗ ${sw.id} is LOCKED under a set route — release the route first`)
+    return s
+  }
+  sw.pos = sw.pos === 'N' ? 'R' : 'N'
+  const dest = linedDest(s.switches)
+  addLog(s, 'ACT', `🔀 ${sw.id} → ${sw.pos === 'R' ? 'REVERSE' : 'NORMAL'}${dest != null ? `, points now line to ${s.platforms[dest].label}` : ', ladder runs straight through'}`)
+  return s
+}
+
+// Convenience: line every unlocked ladder point toward platform index k.
+export function lineToPlatform(prev, platIdx) {
+  const s = cloneState(prev)
+  const path = s.switches.filter((sw) => sw.platIdx <= platIdx)
+  const locked = path.find((sw) => sw.locked && sw.owner)
+  if (locked) {
+    addLog(s, 'ERR', `✗ Cannot line to ${s.platforms[platIdx].label}: ${locked.id} is locked by ${locked.owner}`)
+    return s
+  }
+  s.switches.forEach((sw) => { if (!sw.locked && sw.platIdx <= platIdx) sw.pos = sw.platIdx === platIdx ? 'R' : 'N' })
+  addLog(s, 'ACT', `🔀 Points lined toward ${s.platforms[platIdx].label}`)
+  return s
+}
+
+// Commit the currently-lined route to a train: lock the points, reserve the platform.
+export function setRoute(prev, trainId) {
   const s = cloneState(prev)
   const scenario = getScenario(s.scenarioId)
-  const train = s.trains.find((t) => t.id === trainId)
-  const plat = s.platforms.find((p) => p.id === platId)
-  if (!train || !plat) return prev
-  if (train.needFull && !plat.full) {
-    addLog(s, 'ERR', `✗ Cannot assign ${train.id} → ${plat.label}: requires FULL-length platform`)
+  const t = s.trains.find((x) => x.id === trainId)
+  if (!t) return prev
+  if (t.status === 'AT_PLATFORM' || t.status === 'DEPARTED') {
+    addLog(s, 'ERR', `✗ ${t.id} is not on approach — no arrival route to set`); return s
+  }
+  const dest = linedDest(s.switches)
+  if (dest == null) {
+    addLog(s, 'ERR', `✗ No route lined — throw a point to REVERSE to choose a platform for ${t.id}`); return s
+  }
+  const plat = s.platforms[dest]
+  if (t.needFull && !plat.full) { addLog(s, 'ERR', `✗ ${t.id} → ${plat.label}: needs a FULL-length platform`); return s }
+  if (t.needElec && !plat.elec) { addLog(s, 'ERR', `✗ ${t.id} → ${plat.label}: needs an ELECTRIFIED platform`); return s }
+  if ((plat.status === 'OCCUPIED' || plat.status === 'RESERVED') && plat.trainId && plat.trainId !== t.id) {
+    registerConflict(s, `⚠ CONFLICT: route set into ${plat.label} which already holds ${plat.trainId}`, conflictKey(t.id, plat.trainId))
     s.score = calcScore(s, scenario); return s
   }
-  if (train.needElec && !plat.elec) {
-    addLog(s, 'ERR', `✗ Cannot assign ${train.id} → ${plat.label}: requires ELECTRIFIED platform`)
-    s.score = calcScore(s, scenario); return s
+  const path = s.switches.filter((sw) => sw.platIdx <= dest)
+  const clash = path.find((sw) => sw.locked && sw.owner && sw.owner !== t.id)
+  if (clash) { addLog(s, 'ERR', `✗ Interlocking: ${clash.id} is already locked by ${clash.owner}'s route`); return s }
+  releaseTrainRoute(s, t.id)
+  if (t.platId && t.platId !== plat.id) {
+    const old = s.platforms.find((p) => p.id === t.platId)
+    if (old && old.trainId === t.id && old.status === 'RESERVED') { old.status = 'FREE'; old.trainId = null }
   }
-  if ((plat.status === 'OCCUPIED' || plat.status === 'RESERVED') && plat.trainId && plat.trainId !== train.id) {
-    registerConflict(s, `⚠ CONFLICT: ${plat.label} already holds ${plat.trainId} — cannot assign ${train.id}`, conflictKey(train.id, plat.trainId))
-    s.score = calcScore(s, scenario); return s
-  }
-  // free old platform held by this train
-  if (train.platId && train.platId !== plat.id) {
-    const old = s.platforms.find((p) => p.id === train.platId)
-    if (old && old.trainId === train.id) { old.status = 'FREE'; old.trainId = null }
-  }
-  plat.trainId = train.id
-  plat.status = train.status === 'AT_PLATFORM' ? 'OCCUPIED' : 'RESERVED'
-  train.platId = plat.id
-  addLog(s, 'ACT', `📍 Assigned ${train.id} → platform ${plat.label} (${plat.status})`)
+  path.forEach((sw) => { sw.pos = sw.platIdx === dest ? 'R' : 'N'; sw.locked = true; sw.owner = t.id })
+  plat.status = 'RESERVED'; plat.trainId = t.id
+  t.platId = plat.id; t.routeSet = true
+  addLog(s, 'ACT', `✅ Route set & locked: ${t.id} → ${plat.label} — signal cleared`)
   s.score = calcScore(s, scenario)
+  return s
+}
+
+// Release a not-yet-consumed route, freeing its points and platform reservation.
+export function releaseRoute(prev, trainId) {
+  const s = cloneState(prev)
+  const t = s.trains.find((x) => x.id === trainId)
+  if (!t) return prev
+  if (t.status === 'AT_PLATFORM') { addLog(s, 'ERR', `✗ ${t.id} already berthed — route consumed`); return s }
+  releaseTrainRoute(s, t.id)
+  if (t.platId) {
+    const p = s.platforms.find((x) => x.id === t.platId)
+    if (p && p.trainId === t.id && p.status === 'RESERVED') { p.status = 'FREE'; p.trainId = null }
+  }
+  t.platId = null; t.routeSet = false
+  addLog(s, 'ACT', `↩ Route released for ${t.id} — points free`)
   return s
 }
 
@@ -504,7 +573,7 @@ export default function App() {
   const [screen, setScreen] = useState('home')
   const [mode, setMode] = useState('PLAY')
   const [gameState, setGameState] = useState(null)
-  const [sel, setSel] = useState({ action: null, train: null, platform: null })
+  const [sel, setSel] = useState({ train: null })
   const [llmText, setLlmText] = useState('')
   const [scoreResult, setScoreResult] = useState(null)
   const [copied, setCopied] = useState(false)
@@ -524,23 +593,22 @@ export default function App() {
 
   function startScenario(id) {
     setGameState(initGame(getScenario(id)))
-    setSel({ action: null, train: null, platform: null })
+    setSel({ train: null })
     setLlmText(''); setScoreResult(null); setCopied(false)
     setScreen('game')
   }
   function backHome() { setScreen('home'); setGameState(null) }
   function advance() { setGameState((prev) => tickState(prev)) }
 
-  function chooseAction(a) { setSel((s) => ({ action: s.action === a ? null : a, train: null, platform: null })) }
-  function chooseTrain(id) { if (mode === 'PLAY' && sel.action) setSel((s) => ({ ...s, train: id })) }
-  function choosePlatform(id) { if (mode === 'PLAY' && sel.action === 'ASSIGN') setSel((s) => ({ ...s, platform: id })) }
-  function execute() {
-    if (!sel.action || !sel.train) return
-    if (sel.action === 'ASSIGN') { if (!sel.platform) return; setGameState((prev) => applyAssign(prev, sel.train, sel.platform)) }
-    else if (sel.action === 'HOLD') setGameState((prev) => applyHold(prev, sel.train))
-    else if (sel.action === 'CLEAR') setGameState((prev) => applyClear(prev, sel.train))
-    setSel((s) => ({ action: s.action, train: null, platform: null }))
-  }
+  // Signal-box interactions (PLAY mode, direct manipulation).
+  const playable = mode === 'PLAY' && gameState && !gameState.ended
+  function selectTrain(id) { if (mode === 'PLAY') setSel((s) => ({ train: s.train === id ? null : id })) }
+  function doThrow(swId) { if (playable) setGameState((prev) => throwSwitch(prev, swId)) }
+  function doLine(platIdx) { if (playable) setGameState((prev) => lineToPlatform(prev, platIdx)) }
+  function doSetRoute() { if (playable && sel.train) setGameState((prev) => setRoute(prev, sel.train)) }
+  function doRelease() { if (playable && sel.train) setGameState((prev) => releaseRoute(prev, sel.train)) }
+  function doHold() { if (playable && sel.train) setGameState((prev) => applyHold(prev, sel.train)) }
+  function doClear() { if (playable && sel.train) setGameState((prev) => applyClear(prev, sel.train)) }
 
   function copyPrompt() {
     const done = () => { setCopied(true); setTimeout(() => setCopied(false), 2000) }
@@ -577,9 +645,9 @@ export default function App() {
         <ScoreBar score={gameState.score} />
       </div>
 
-      <TrackYard
-        state={gameState} scenario={scenario} platforms={gameState.platforms} trains={gameState.trains}
-        mode={mode} sel={sel} onPickTrain={chooseTrain} onPickPlatform={choosePlatform}
+      <InterlockingYard
+        state={gameState} scenario={scenario} mode={mode} sel={sel}
+        onPickTrain={selectTrain} onLine={doLine} onThrow={doThrow}
         onAdvance={advance} ended={gameState.ended}
       />
 
@@ -593,11 +661,16 @@ export default function App() {
 
       <div style={{ display: 'flex', alignItems: 'flex-start', flexWrap: 'wrap' }}>
         <div style={{ width: 300, flexShrink: 0, padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {mode === 'PLAY' && <ControlPanel sel={sel} onAction={chooseAction} onExecute={execute} />}
-          <PlatformList platforms={gameState.platforms} trains={gameState.trains} mode={mode} sel={sel} onPick={choosePlatform} />
+          {mode === 'PLAY' && (
+            <SignalBox
+              state={gameState} sel={sel}
+              onSetRoute={doSetRoute} onRelease={doRelease} onHold={doHold} onClear={doClear}
+            />
+          )}
+          <PlatformList platforms={gameState.platforms} trains={gameState.trains} switches={gameState.switches} mode={mode} onPick={doLine} />
         </div>
         <div style={{ flex: 1, minWidth: 320, display: 'flex', flexDirection: 'column' }}>
-          <TrainTable trains={gameState.trains} platforms={gameState.platforms} mode={mode} sel={sel} onPick={chooseTrain} />
+          <TrainTable trains={gameState.trains} platforms={gameState.platforms} mode={mode} sel={sel} onPick={selectTrain} />
           <EventLog log={gameState.log} />
         </div>
       </div>
@@ -730,180 +803,198 @@ function ScoreBar({ score }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Live track yard — the visual centerpiece. SVG rails/throats + HTML train cards
-// that animate between approach → platform → departure as the game ticks.
+// Realistic interlocking yard — a ladder of points (turnouts) the operator throws
+// to line routes from the approach into platforms. Track blocks show occupancy,
+// signals show aspects, and trains follow whatever route has been set for them.
 // ─────────────────────────────────────────────────────────────────────────────
-function platStatusColor(p) {
-  return p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.dim
+function blockColor(p) {
+  // signalling convention: occupied track = red, set route = green, free = dark
+  return p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.red : p.status === 'RESERVED' ? C.green : C.dim
 }
 
-function TrackYard({ state, scenario, platforms, trains, mode, sel, onPickTrain, onPickPlatform, onAdvance, ended }) {
+function SignalLamp({ x, y, color, label }) {
+  return (
+    <div style={{ position: 'absolute', left: x, top: y, display: 'flex', flexDirection: 'column', alignItems: 'center', pointerEvents: 'none' }}>
+      <div style={{ width: 10, height: 10, borderRadius: '50%', background: color, boxShadow: `0 0 6px ${color}`, border: `1px solid ${C.bg}` }} />
+      {label && <span style={{ fontSize: 7, color: C.dim, marginTop: 1 }}>{label}</span>}
+    </div>
+  )
+}
+
+function InterlockingYard({ state, scenario, mode, sel, onPickTrain, onLine, onThrow, onAdvance, ended }) {
+  const { platforms, trains, switches } = state
   const n = platforms.length
-  const VW = 1000
-  const topPad = 56, trackGap = 64, botPad = 30
-  const H = topPad + n * trackGap + botPad
-  const yFor = (i) => topPad + i * trackGap
-  const X = { stage: 78, appStart: 168, platL: 372, island: 520, platR: 700, depart: 936 }
-  const yMid = topPad + (n * trackGap) / 2 - trackGap / 2
-  const idx = {}
-  platforms.forEach((p, i) => { idx[p.id] = i })
-  const pct = (x) => `${(x / VW) * 100}%`
+  const gap = 60, top = 100, bottom = 58, receptionY = 30
+  const Tx = (i) => 150 + i * 72
+  const yFor = (i) => top + i * gap
+  const platRight = Tx(n - 1) + 340
+  const exitX = platRight + 108
+  const W = exitX + 36
+  const H = yFor(n - 1) + bottom
+  const E = { x: 56, y: yFor(0) - 26 }
+  const berthX = (i) => Tx(i) + 150
+  const yMidE = yFor(0) + ((n - 1) * gap) / 2
+  const idxOf = {}; platforms.forEach((p, i) => { idxOf[p.id] = i })
+  const dest = linedDest(switches)
+  const playable = mode === 'PLAY' && !ended
+  const anyRouteSet = trains.some((t) => t.routeSet)
 
-  const assignActive = mode === 'PLAY' && sel.action === 'ASSIGN'
-  const trainClickable = mode === 'PLAY' && !!sel.action
-
-  // Trains waiting for a platform (and not-yet-arrived) queue in the approach yard.
   const holding = trains
-    .filter((t) => t.status === 'SCHEDULED' || (t.status === 'APPROACHING' && !t.platId))
+    .filter((t) => t.status === 'SCHEDULED' || (t.status === 'APPROACHING' && !t.routeSet))
     .sort((a, b) => (a.arr ?? 1e9) - (b.arr ?? 1e9))
-  const holdSlot = {}
-  holding.forEach((t, k) => { holdSlot[t.id] = k })
-  const holdY = (k) => topPad + 4 + k * 50
+  const holdSlot = {}; holding.forEach((t, k) => { holdSlot[t.id] = k })
+  const holdX = (k) => 150 + k * 176
 
-  function target(t) {
-    if (t.status === 'DEPARTED') {
-      const i = t.platId != null && idx[t.platId] != null ? idx[t.platId] : Math.floor(n / 2)
-      return { x: X.depart, y: yFor(i), op: 0.3 }
-    }
-    if (t.status === 'AT_PLATFORM') return { x: X.island, y: yFor(idx[t.platId] ?? 0), op: 1 }
-    if (t.status === 'APPROACHING' && t.platId != null && idx[t.platId] != null) {
-      const arrAt = (t.arr ?? state.time) + t.delay
+  const lerp = (a, b, t) => a + (b - a) * t
+  function pointAlong(pts, t) {
+    if (t <= 0) return pts[0]
+    if (t >= 1) return pts[pts.length - 1]
+    const segs = []; let total = 0
+    for (let i = 0; i < pts.length - 1; i++) { const d = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y); segs.push(d); total += d }
+    let target = t * total
+    for (let i = 0; i < segs.length; i++) { if (target <= segs[i]) { const f = segs[i] ? target / segs[i] : 0; return { x: lerp(pts[i].x, pts[i + 1].x, f), y: lerp(pts[i].y, pts[i + 1].y, f) } } target -= segs[i] }
+    return pts[pts.length - 1]
+  }
+  function routePath(k) {
+    const pts = [E]
+    for (let i = 0; i <= k; i++) pts.push({ x: Tx(i), y: yFor(i) })
+    pts.push({ x: berthX(k), y: yFor(k) })
+    return pts
+  }
+  function trainPos(t) {
+    if (t.status === 'DEPARTED') { const i = idxOf[t.platId] ?? Math.floor(n / 2); return { x: exitX, y: yFor(i), op: 0.28 } }
+    if (t.status === 'AT_PLATFORM') { const i = idxOf[t.platId] ?? 0; return { x: berthX(i), y: yFor(i), op: 1 } }
+    if (t.status === 'APPROACHING' && t.routeSet && idxOf[t.platId] != null) {
+      const i = idxOf[t.platId]; const arrAt = (t.arr ?? state.time) + t.delay
       const prog = Math.max(0, Math.min(1, (state.time - (arrAt - 6)) / 6))
-      return { x: X.appStart + (X.platL - X.appStart) * prog, y: yFor(idx[t.platId]), op: 1 }
+      return { ...pointAlong(routePath(i), prog), op: 1 }
     }
-    const k = holdSlot[t.id] ?? 0
-    return { x: X.stage, y: holdY(k), op: t.status === 'SCHEDULED' ? 0.55 : 1 }
+    const k = holdSlot[t.id] ?? 0; return { x: holdX(k), y: receptionY + 14, op: t.status === 'SCHEDULED' ? 0.5 : 1 }
   }
 
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, margin: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
-        <span style={{ ...sectionTitle, margin: 0 }}>● LIVE TRACK YARD</span>
-        <span style={{ fontSize: 10, color: C.dim }}>◀ approach &nbsp;·&nbsp; platforms &nbsp;·&nbsp; departure ▶</span>
+        <span style={{ ...sectionTitle, margin: 0 }}>⊟ INTERLOCKING — {scenario.station}</span>
+        {playable && (
+          <span style={{ fontSize: 10, color: C.dim }}>points lined to:{' '}
+            <b style={{ color: dest != null ? C.green : C.dim }}>{dest != null ? platforms[dest].label : '— none (ladder runs straight) —'}</b>
+          </span>
+        )}
         <div style={{ flex: 1 }} />
-        {trainClickable && <span style={{ fontSize: 10, color: C.blue }}>▸ click a {assignActive ? 'train, then a platform' : 'train'} below</span>}
         <span style={{ fontSize: 11, color: C.muted, fontVariantNumeric: 'tabular-nums' }}>{formatTime(state.time)} · T+{state.elapsed}/{scenario.duration}</span>
-        <button onClick={onAdvance} disabled={ended} style={{
-          ...btn(ended ? C.border : C.blue, ended ? C.dim : '#fff'),
-          background: ended ? C.panel : C.blue, fontWeight: 'bold', cursor: ended ? 'not-allowed' : 'pointer',
-        }}>{ended ? '■ ENDED' : '⏭ ADVANCE 1 MIN'}</button>
+        <button onClick={onAdvance} disabled={ended} style={{ ...btn(ended ? C.border : C.blue, ended ? C.dim : '#fff'), background: ended ? C.panel : C.blue, fontWeight: 'bold', cursor: ended ? 'not-allowed' : 'pointer' }}>{ended ? '■ ENDED' : '⏭ ADVANCE 1 MIN'}</button>
       </div>
 
       <div style={{ overflowX: 'auto' }}>
-        <div style={{ position: 'relative', minWidth: 760, height: H }}>
-          {/* rails, throats, sleepers */}
-          <svg viewBox={`0 0 ${VW} ${H}`} width="100%" height={H} preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, display: 'block' }}>
-            <rect x={0} y={topPad - 14} width={X.appStart - 6} height={H - topPad - 6} fill={C.bg} opacity={0.5} rx={6} />
-            <rect x={X.depart - 8} y={topPad - 14} width={VW - X.depart + 6} height={H - topPad - 6} fill={C.bg} opacity={0.5} rx={6} />
+        <div style={{ position: 'relative', width: W, height: H }}>
+          <svg width={W} height={H} style={{ position: 'absolute', inset: 0, display: 'block' }}>
+            <rect x={130} y={receptionY - 6} width={Math.max(60, holding.length * 176)} height={42} rx={6} fill={C.bg} stroke={C.border} strokeDasharray="3 3" />
+            {/* approach line into the ladder */}
+            <line x1={20} y1={E.y} x2={E.x} y2={E.y} stroke={C.muted} strokeWidth={3} />
+            <line x1={E.x} y1={E.y} x2={Tx(0)} y2={yFor(0)} stroke={anyRouteSet ? C.green : C.dim} strokeWidth={3} />
+            {/* ladder through-segments */}
+            {platforms.slice(0, n - 1).map((_, i) => {
+              const through = switches[i].locked && switches[i].pos === 'N'
+              return <line key={i} x1={Tx(i)} y1={yFor(i)} x2={Tx(i + 1)} y2={yFor(i + 1)} stroke={through ? C.green : C.dim} strokeWidth={3} />
+            })}
+            {/* buffer past the last turnout */}
+            <line x1={Tx(n - 1)} y1={yFor(n - 1)} x2={Tx(n - 1) + 28} y2={yFor(n - 1) + 20} stroke={C.dim} strokeWidth={2.5} />
+            {/* per-platform diverge blade, twin rails, sleepers, east connector */}
             {platforms.map((p, i) => {
-              const y = yFor(i)
-              const sc = platStatusColor(p)
+              const y = yFor(i); const bc = blockColor(p)
+              const rev = switches[i].pos === 'R'
+              const divColor = switches[i].locked ? C.green : rev ? C.yellow : C.dim
               return (
                 <g key={p.id}>
-                  {/* approach + departure throats */}
-                  <line x1={X.appStart} y1={yMid} x2={X.platL} y2={y} stroke={C.border} strokeWidth={1.4} strokeDasharray="4 4" />
-                  <line x1={X.platR} y1={y} x2={X.depart} y2={yMid} stroke={C.border} strokeWidth={1.4} strokeDasharray="4 4" />
-                  {/* twin rails across the platform road */}
-                  <line x1={X.appStart} y1={y - 3} x2={X.depart} y2={y - 3} stroke={C.dim} strokeWidth={1.4} />
-                  <line x1={X.appStart} y1={y + 3} x2={X.depart} y2={y + 3} stroke={C.dim} strokeWidth={1.4} />
-                  {/* sleepers along the platform segment */}
-                  {Array.from({ length: 9 }).map((_, k) => {
-                    const sx = X.platL + ((X.platR - X.platL) / 8) * k
-                    return <line key={k} x1={sx} y1={y - 5} x2={sx} y2={y + 5} stroke={C.border} strokeWidth={1} />
-                  })}
-                  {/* platform island slab */}
-                  <rect x={X.platL} y={y + 9} width={X.platR - X.platL} height={16} rx={3} fill={sc + '22'} stroke={sc} strokeWidth={1} />
+                  <line x1={Tx(i)} y1={y} x2={Tx(i) + 26} y2={y} stroke={divColor} strokeWidth={rev ? 3 : 1.6} strokeDasharray={rev ? '0' : '3 3'} />
+                  <line x1={Tx(i) + 24} y1={y - 3} x2={platRight} y2={y - 3} stroke={bc} strokeWidth={2} />
+                  <line x1={Tx(i) + 24} y1={y + 3} x2={platRight} y2={y + 3} stroke={bc} strokeWidth={2} />
+                  {Array.from({ length: 10 }).map((_, k) => { const sx = Tx(i) + 44 + k * ((platRight - Tx(i) - 54) / 9); return <line key={k} x1={sx} y1={y - 5} x2={sx} y2={y + 5} stroke={C.border} strokeWidth={1} /> })}
+                  <line x1={platRight} y1={y} x2={exitX} y2={yMidE} stroke={C.border} strokeWidth={1.3} strokeDasharray="4 4" />
                 </g>
               )
             })}
+            <line x1={exitX} y1={yMidE} x2={W - 8} y2={yMidE} stroke={C.muted} strokeWidth={3} />
           </svg>
 
-          {/* zone labels */}
-          <div style={{ position: 'absolute', left: pct(X.stage), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim, whiteSpace: 'nowrap' }}>◀ APPROACH</div>
-          <div style={{ position: 'absolute', left: pct(X.island), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim }}>PLATFORMS</div>
-          <div style={{ position: 'absolute', left: pct(X.depart), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim }}>DEPARTURE ▶</div>
+          <div style={{ position: 'absolute', left: 18, top: receptionY - 22, fontSize: 9, color: C.dim }}>◀ APPROACH / RECEPTION</div>
+          <div style={{ position: 'absolute', left: exitX - 26, top: yMidE - 26, fontSize: 9, color: C.dim }}>DEPARTURE ▶</div>
+          <SignalLamp x={E.x - 6} y={E.y - 20} color={anyRouteSet ? C.green : C.red} label="entry" />
 
-          {/* platform island labels + signals (HTML overlay, clickable to assign) */}
+          {/* turnouts (clickable) + platform labels + signals */}
           {platforms.map((p, i) => {
-            const sc = platStatusColor(p)
-            const isTarget = sel.platform === p.id
-            const sigColor = p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.green
+            const sw = switches[i]; const y = yFor(i); const bc = blockColor(p)
+            const routeIn = p.status === 'RESERVED' ? C.green : p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.red : C.dim
+            const occ = p.trainId ? trains.find((t) => t.id === p.trainId) : null
+            const startCol = p.sigFail ? C.red : occ && occ.blocked ? C.red : occ ? C.green : C.dim
+            const lit = dest === i
             return (
               <React.Fragment key={p.id}>
-                <div
-                  onClick={() => assignActive && onPickPlatform(p.id)}
-                  title={`Platform ${p.label}`}
+                <button onClick={() => playable && onThrow(sw.id)} title={`${sw.id} — ${sw.pos === 'R' ? 'REVERSE' : 'NORMAL'}${sw.locked ? ' (locked)' : ''}`}
                   style={{
-                    position: 'absolute', left: pct(X.platL), width: pct(X.platR - X.platL), top: yFor(i) + 26,
-                    boxSizing: 'border-box', padding: '2px 7px', borderRadius: 5,
-                    border: `1px solid ${isTarget ? C.blue : 'transparent'}`,
-                    background: isTarget ? C.blue + '22' : 'transparent',
-                    cursor: assignActive ? 'pointer' : 'default',
-                    display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6,
+                    position: 'absolute', left: Tx(i) - 16, top: y - 14, width: 32, height: 28, borderRadius: 6,
+                    cursor: playable ? 'pointer' : 'default', padding: 0,
+                    background: sw.locked ? C.green + '22' : lit ? C.yellow + '22' : C.panel,
+                    border: `1px solid ${sw.locked ? C.green : lit ? C.yellow : C.border}`,
+                    color: sw.pos === 'R' ? C.yellow : C.muted, fontFamily: FONT, fontSize: 11, fontWeight: 'bold',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>{sw.locked ? '🔒' : sw.pos}</button>
+                <SignalLamp x={Tx(i) + 30} y={y - 18} color={routeIn} />
+                <div onClick={() => playable && onLine(i)} title={`Line points toward ${p.label}`}
+                  style={{
+                    position: 'absolute', left: platRight - 96, top: y - 11, padding: '2px 7px', borderRadius: 5,
+                    border: `1px solid ${lit ? C.yellow : C.border}`, background: C.panel, cursor: playable ? 'pointer' : 'default',
+                    display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap',
                   }}>
-                  <span style={{ color: C.bright, fontWeight: 'bold', fontSize: 11, whiteSpace: 'nowrap' }}>{p.label}</span>
-                  <span style={{ color: C.muted, fontSize: 9, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {p.full ? 'FULL' : 'SHORT'}{p.elec ? ' ⚡' : ''}{p.sigFail ? ' ⚠' : ''}
-                  </span>
+                  <span style={{ color: bc === C.dim ? C.bright : bc, fontWeight: 'bold', fontSize: 11 }}>{p.label}</span>
+                  <span style={{ color: C.muted, fontSize: 8.5 }}>{p.full ? 'FULL' : 'SHORT'}{p.elec ? ' ⚡' : ''}{p.sigFail ? ' ⚠' : ''}</span>
                 </div>
-                {/* departure signal light */}
-                <div style={{ position: 'absolute', left: pct(X.platR + 14), top: yFor(i) - 6, transform: 'translateX(-50%)', width: 11, height: 11, borderRadius: '50%', background: sigColor, boxShadow: `0 0 6px ${sigColor}`, border: `1px solid ${C.bg}` }} />
+                <SignalLamp x={platRight + 6} y={y - 5} color={startCol} />
               </React.Fragment>
             )
           })}
 
           {/* trains */}
           {trains.map((t) => {
-            const tp = target(t)
-            const tcol = TRAIN_TYPE_COLORS[t.type]
-            const onSigPlat = t.platId && platforms.find((p) => p.id === t.platId)?.sigFail
+            const tp = trainPos(t); const tcol = TRAIN_TYPE_COLORS[t.type]
+            const onSig = t.platId && platforms.find((p) => p.id === t.platId)?.sigFail
             const isSel = sel.train === t.id
             const border = isSel ? C.blue : t.blocked ? C.red : tcol
-            const subtitle = t.blocked ? '🔒 BLOCKED' : t.status === 'DEPARTED' ? '✓ departed' : `${t.pax}p · P${t.priority}`
+            const sub = t.blocked ? '🔒 BLOCKED' : t.status === 'DEPARTED' ? '✓ departed' : t.routeSet ? `▶ routed → ${t.platId}` : `${t.pax}p · P${t.priority}`
             return (
-              <div key={t.id}
-                onClick={() => trainClickable && onPickTrain(t.id)}
-                style={{
-                  position: 'absolute', left: pct(tp.x), top: tp.y, width: 138, height: 44,
-                  transform: 'translate(-50%, -50%)', transition: 'left .6s ease, top .6s ease, opacity .5s ease',
-                  opacity: tp.op, cursor: trainClickable ? 'pointer' : 'default', zIndex: t.status === 'AT_PLATFORM' ? 6 : 5,
-                }}>
-                <div style={{
-                  display: 'flex', height: '100%', background: C.panel, border: `2px solid ${border}`,
-                  borderRadius: '7px 13px 13px 7px', overflow: 'hidden',
-                  boxShadow: isSel ? `0 0 0 3px ${C.blue}55` : '0 2px 4px #0007',
-                }}>
-                  <div style={{ width: 6, background: tcol, flexShrink: 0 }} />
+              <div key={t.id} onClick={() => mode === 'PLAY' && onPickTrain(t.id)}
+                style={{ position: 'absolute', left: tp.x, top: tp.y, width: 150, height: 42, transform: 'translate(-50%,-50%)', transition: 'left .6s ease, top .6s ease, opacity .5s', opacity: tp.op, cursor: mode === 'PLAY' ? 'pointer' : 'default', zIndex: t.status === 'AT_PLATFORM' ? 6 : 5 }}>
+                <div style={{ display: 'flex', height: '100%', background: C.panel, border: `2px solid ${border}`, borderRadius: '6px 12px 12px 6px', overflow: 'hidden', boxShadow: isSel ? `0 0 0 3px ${C.blue}55` : '0 2px 4px #0007' }}>
+                  <div style={{ width: 6, background: tcol }} />
                   <div style={{ flex: 1, padding: '3px 6px', minWidth: 0 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 4 }}>
                       <span style={{ color: C.bright, fontWeight: 'bold', fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.id}</span>
-                      {t.delay > 0 && <span style={{ color: '#1a1200', background: C.yellow, borderRadius: 5, fontSize: 8, padding: '0 4px', fontWeight: 'bold', flexShrink: 0 }}>+{t.delay}</span>}
+                      {t.delay > 0 && <span style={{ color: '#1a1200', background: C.yellow, borderRadius: 5, fontSize: 8, padding: '0 4px', fontWeight: 'bold' }}>+{t.delay}</span>}
                     </div>
-                    <div style={{ color: t.blocked ? C.red : C.muted, fontSize: 8.5, fontWeight: t.blocked ? 'bold' : 'normal', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{subtitle}</div>
+                    <div style={{ color: t.blocked ? C.red : C.muted, fontSize: 8.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{sub}</div>
                   </div>
-                  <div style={{ width: 22, background: tcol + '2e', borderLeft: `1px solid ${tcol}`, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', flexShrink: 0 }}>
-                    <div style={{ width: 9, height: 8, background: C.bg, borderRadius: 2, border: `1px solid ${tcol}` }} />
-                    {onSigPlat && <span style={{ position: 'absolute', top: -1, right: 0, fontSize: 9 }}>⚠</span>}
+                  <div style={{ width: 20, background: tcol + '2e', borderLeft: `1px solid ${tcol}`, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
+                    <div style={{ width: 8, height: 7, background: C.bg, borderRadius: 2, border: `1px solid ${tcol}` }} />
+                    {onSig && <span style={{ position: 'absolute', top: -1, right: 0, fontSize: 9 }}>⚠</span>}
                   </div>
                 </div>
-                <div style={{ position: 'absolute', bottom: -3, left: 16, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
-                <div style={{ position: 'absolute', bottom: -3, right: 26, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
+                <div style={{ position: 'absolute', bottom: -3, left: 14, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
+                <div style={{ position: 'absolute', bottom: -3, right: 24, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
               </div>
             )
           })}
         </div>
       </div>
 
-      {/* legend */}
       <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}`, fontSize: 10, color: C.muted }}>
         {Object.entries(TRAIN_TYPE_COLORS).map(([k, v]) => (
-          <span key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-            <span style={{ width: 10, height: 10, background: v, borderRadius: 2, display: 'inline-block' }} />{k.replace('_', ' ')}
-          </span>
+          <span key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, background: v, borderRadius: 2 }} />{k.replace('_', ' ')}</span>
         ))}
         <span style={{ flex: 1 }} />
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.green, display: 'inline-block' }} />clear</span>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.red, display: 'inline-block' }} />signal down</span>
+        <span><b style={{ color: C.muted }}>N/R</b> point normal/reverse · 🔒 locked</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.green }} />route/clear</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.red }} />occupied/blocked</span>
       </div>
     </div>
   )
@@ -912,29 +1003,32 @@ function TrackYard({ state, scenario, platforms, trains, mode, sel, onPickTrain,
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform list (left panel)
 // ─────────────────────────────────────────────────────────────────────────────
-function PlatformList({ platforms, trains, mode, sel, onPick }) {
-  const clickable = mode === 'PLAY' && sel.action === 'ASSIGN'
+function PlatformList({ platforms, trains, switches, mode, onPick }) {
+  const clickable = mode === 'PLAY'
+  const dest = switches ? linedDest(switches) : null
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 8 }}>
-      <div style={sectionTitle}>PLATFORMS</div>
+      <div style={sectionTitle}>PLATFORMS / BLOCKS</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {platforms.map((p) => {
+        {platforms.map((p, i) => {
           const tr = p.trainId ? trains.find((t) => t.id === p.trainId) : null
-          const isTarget = sel.platform === p.id
-          const statusColor = p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.dim
+          const sw = switches ? switches[i] : null
+          const lit = dest === i
+          const statusColor = p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.red : p.status === 'RESERVED' ? C.green : C.dim
           return (
-            <div key={p.id} onClick={() => clickable && onPick(p.id)} style={{
-              border: `1px solid ${isTarget ? C.blue : p.sigFail ? C.red : C.border}`,
-              background: isTarget ? C.blue + '18' : C.panel, borderRadius: 6, padding: '7px 9px',
+            <div key={p.id} onClick={() => clickable && onPick(i)} style={{
+              border: `1px solid ${lit ? C.yellow : p.sigFail ? C.red : C.border}`,
+              background: lit ? C.yellow + '14' : C.panel, borderRadius: 6, padding: '7px 9px',
               cursor: clickable ? 'pointer' : 'default',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ color: C.bright, fontWeight: 'bold', fontSize: 13 }}>Platform {p.label}</span>
                 <span style={{ fontSize: 10, color: statusColor, fontWeight: 'bold' }}>{p.status}</span>
               </div>
-              <div style={{ display: 'flex', gap: 8, fontSize: 10, color: C.muted, marginTop: 3 }}>
+              <div style={{ display: 'flex', gap: 8, fontSize: 10, color: C.muted, marginTop: 3, flexWrap: 'wrap' }}>
                 <span>{p.full ? 'FULL' : 'SHORT'}</span>
                 <span>{p.elec ? '⚡ AC' : 'no power'}</span>
+                {sw && <span style={{ color: sw.locked ? C.green : sw.pos === 'R' ? C.yellow : C.dim }}>pts {sw.locked ? '🔒' : sw.pos}</span>}
                 {p.sigFail && <span style={{ color: C.red }}>⚠ SIG FAIL</span>}
               </div>
               {tr && (
@@ -946,45 +1040,42 @@ function PlatformList({ platforms, trains, mode, sel, onPick }) {
           )
         })}
       </div>
-      {clickable && <div style={{ fontSize: 10, color: C.blue, marginTop: 8 }}>▸ Click a platform to set the assignment target</div>}
+      {clickable && <div style={{ fontSize: 10, color: C.blue, marginTop: 8 }}>▸ Click a platform to line the points toward its block</div>}
     </div>
   )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Control panel (PLAY mode)
+// Signal box (PLAY mode) — route setting + train regulation
 // ─────────────────────────────────────────────────────────────────────────────
-function ControlPanel({ sel, onAction, onExecute }) {
-  const canExec = sel.action && sel.train && (sel.action !== 'ASSIGN' || sel.platform)
-  const actBtn = (a, label, color) => (
-    <button onClick={() => onAction(a)} style={{
-      ...btn(sel.action === a ? color : C.border, sel.action === a ? '#fff' : C.body),
-      background: sel.action === a ? color : C.panel, textAlign: 'left', width: '100%',
+function SignalBox({ state, sel, onSetRoute, onRelease, onHold, onClear }) {
+  const t = sel.train ? state.trains.find((x) => x.id === sel.train) : null
+  const dest = linedDest(state.switches)
+  const onApproach = t && (t.status === 'APPROACHING' || t.status === 'SCHEDULED')
+  const Btn = (label, onClick, color, enabled) => (
+    <button onClick={() => enabled && onClick()} disabled={!enabled} style={{
+      ...btn(enabled ? color : C.border, enabled ? '#fff' : C.dim),
+      background: enabled ? color : C.panel, width: '100%', textAlign: 'left', fontWeight: 'bold',
+      marginBottom: 6, cursor: enabled ? 'pointer' : 'not-allowed',
     }}>{label}</button>
   )
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10 }}>
-      <div style={sectionTitle}>CONTROL PANEL</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {actBtn('ASSIGN', '📍 Assign Platform', C.blue)}
-        {actBtn('HOLD', '⏸ Hold +5 min', C.yellow)}
-        {actBtn('CLEAR', '🟢 Priority Clear', C.green)}
+      <div style={sectionTitle}>⊟ SIGNAL BOX</div>
+      <div style={{ fontSize: 10.5, color: C.muted, lineHeight: 1.6, marginBottom: 8 }}>
+        1 · select a train. 2 · throw points <b style={{ color: C.bright }}>N/R</b> in the yard (or click a platform) to line a route. 3 · SET ROUTE — the train runs when its signal clears.
       </div>
-      {sel.action && (
-        <div style={{ marginTop: 8, fontSize: 11, color: C.muted, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: 8, lineHeight: 1.7 }}>
-          <div>Action: <b style={{ color: C.bright }}>{sel.action}</b></div>
-          <div>Train: <b style={{ color: sel.train ? C.bright : C.dim }}>{sel.train || '— click a train row —'}</b></div>
-          {sel.action === 'ASSIGN' && <div>Platform: <b style={{ color: sel.platform ? C.bright : C.dim }}>{sel.platform || '— click a platform —'}</b></div>}
-        </div>
-      )}
-      {canExec && (
-        <button onClick={onExecute} style={{ ...btn(C.green, '#fff'), background: C.green, width: '100%', marginTop: 8, fontWeight: 'bold' }}>
-          ✓ EXECUTE {sel.action}
-        </button>
-      )}
-      <div style={{ marginTop: 10, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
-        Select an action, click a train in the yard (and a platform for assign), then EXECUTE.
-        Advance time with ⏭ in the yard toolbar above.
+      <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 6, padding: 8, marginBottom: 8, fontSize: 11, lineHeight: 1.7 }}>
+        <div>Train: <b style={{ color: t ? C.bright : C.dim }}>{t ? t.id : '— none selected —'}</b></div>
+        <div>Points lined to: <b style={{ color: dest != null ? C.green : C.dim }}>{dest != null ? state.platforms[dest].label : '— none —'}</b></div>
+        {t && <div>Status: <b style={{ color: t.blocked ? C.red : C.body }}>{t.blocked ? 'BLOCKED' : t.status}{t.routeSet ? ' · route set' : ''}</b></div>}
+      </div>
+      {Btn(dest != null && onApproach ? `✅ SET ROUTE → ${state.platforms[dest].label}` : '✅ SET ROUTE', onSetRoute, C.green, !!(t && onApproach && dest != null))}
+      {Btn('↩ RELEASE ROUTE', onRelease, C.yellow, !!(t && t.routeSet))}
+      {Btn('⏸ HOLD +5 min', onHold, C.blue, !!t)}
+      {Btn('🟢 PRIORITY CLEAR −3 min', onClear, C.purple, !!(t && !t.blocked))}
+      <div style={{ fontSize: 9.5, color: C.dim, lineHeight: 1.5, marginTop: 2 }}>
+        Points lock under a set route; release it before re-lining. Advance time with ⏭ in the yard.
       </div>
     </div>
   )
@@ -997,7 +1088,7 @@ function TrainTable({ trains, platforms, mode, sel, onPick }) {
   const th = (label) => (
     <th style={{ textAlign: 'left', padding: '6px 8px', color: C.muted, fontSize: 10, fontWeight: 'normal', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', position: 'sticky', top: 0, background: C.card }}>{label}</th>
   )
-  const clickable = mode === 'PLAY' && !!sel.action
+  const clickable = mode === 'PLAY'
   return (
     <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, margin: 12, overflow: 'hidden' }}>
       <div style={{ ...sectionTitle, padding: '8px 10px 0', margin: 0 }}>TRAINS</div>
@@ -1031,7 +1122,7 @@ function TrainTable({ trains, platforms, mode, sel, onPick }) {
           </tbody>
         </table>
       </div>
-      {clickable && <div style={{ fontSize: 10, color: C.blue, padding: '6px 10px' }}>▸ Click a train row to select it for {sel.action}</div>}
+      {clickable && <div style={{ fontSize: 10, color: C.blue, padding: '6px 10px' }}>▸ Click a train row to select it in the signal box</div>}
     </div>
   )
 }

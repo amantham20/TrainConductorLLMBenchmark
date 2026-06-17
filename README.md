@@ -19,9 +19,10 @@ npm run preview  # preview the production build
 
 ## Two modes
 
-- **▶ PLAY** — you control the station. Assign trains to platforms, hold or
-  priority-clear departures, and advance time minute by minute while honoring
-  platform-length, electrification, and single-occupancy safety constraints.
+- **▶ PLAY** — you are the signaller. Throw points to line routes through the
+  interlocking, set/release routes, hold or priority-clear departures, and
+  advance time minute by minute while honoring platform-length, electrification,
+  and single-occupancy (block) safety constraints.
 - **🤖 BENCHMARK** — TrainBench renders the current situation as a fixed-width
   prompt for any LLM, scored across five dimensions. Either **copy/paste** the
   model's JSON reply, or **run it live**: enter an OpenAI-compatible or
@@ -30,14 +31,30 @@ npm run preview  # preview the production build
   history compares models). The endpoint must allow cross-origin (CORS) browser
   requests; the API key is stored only in your browser's localStorage.
 
-## The live track yard
+## The interlocking yard
 
-The centerpiece is an animated track yard: an approach throat on the left,
-platform roads (twin rails, sleepers, signal lights) in the middle, and a
-departure throat on the right. Each train is a card that slides from the
-approach yard onto its assigned platform and off to departure as the clock
-advances — blocked trains and downed signals are shown in red. In PLAY mode you
-can click trains and platforms directly in the yard to route them.
+The centerpiece is a working signalling interlocking, not just a map. The throat
+is drawn as a real **ladder of points (turnouts)** descending from the approach,
+with platform roads branching off, track **blocks** coloured by occupancy
+(red = occupied, green = a set route, dark = clear), and **signals** at the
+approach, each platform entry, and each starting (departure) end.
+
+In PLAY mode you operate it like a signaller:
+
+1. **Select a train** (click it in the yard or the train table).
+2. **Line a route** — throw points **N/R** in the yard (the first point set to
+   REVERSE peels the route off the ladder onto its platform), or click a
+   platform to line the whole path at once. The header shows where the points
+   currently lead.
+3. **SET ROUTE** in the signal box — this *locks* the points, reserves the
+   platform block, and clears the signal. The train then runs down the ladder
+   and berths; clearing the throat releases the points for the next move.
+
+The interlocking enforces realistic rules: a held train will not move until its
+route is set, points **lock** under a set route (you must RELEASE to re-line),
+you cannot line a route through points another route already holds, and routing
+into an occupied block is a conflict (a safety penalty). HOLD / PRIORITY CLEAR
+regulate delays; ADVANCE steps the clock one minute.
 
 ## Scenarios
 
