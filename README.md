@@ -23,8 +23,21 @@ npm run preview  # preview the production build
   priority-clear departures, and advance time minute by minute while honoring
   platform-length, electrification, and single-occupancy safety constraints.
 - **🤖 BENCHMARK** — TrainBench renders the current situation as a fixed-width
-  prompt for any LLM. Paste the model's JSON decisions back and it is scored
-  across five dimensions.
+  prompt for any LLM, scored across five dimensions. Either **copy/paste** the
+  model's JSON reply, or **run it live**: enter an OpenAI-compatible or
+  Anthropic endpoint URL, token, and model id and TrainBench calls the model
+  from the browser and scores the reply automatically (a per-session run
+  history compares models). The endpoint must allow cross-origin (CORS) browser
+  requests; the API key is stored only in your browser's localStorage.
+
+## The live track yard
+
+The centerpiece is an animated track yard: an approach throat on the left,
+platform roads (twin rails, sleepers, signal lights) in the middle, and a
+departure throat on the right. Each train is a card that slides from the
+approach yard onto its assigned platform and off to departure as the clock
+advances — blocked trains and downed signals are shown in red. In PLAY mode you
+can click trains and platforms directly in the yard to route them.
 
 ## Scenarios
 

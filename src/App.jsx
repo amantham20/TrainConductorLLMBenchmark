@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { SCENARIOS, TRAIN_TYPE_COLORS, getScenario } from './scenarios.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,6 +441,63 @@ export function scoreLLMResponse(raw, scenario) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live LLM API client (browser → model endpoint)
+// ─────────────────────────────────────────────────────────────────────────────
+const API_DEFAULT_BASE = { openai: 'https://api.openai.com/v1', anthropic: 'https://api.anthropic.com/v1' }
+
+function loadApiCfg() {
+  const fallback = { provider: 'openai', baseUrl: '', apiKey: '', model: '' }
+  try {
+    const s = JSON.parse(localStorage.getItem('trainbench_api') || '{}')
+    return { ...fallback, ...s }
+  } catch (e) { return fallback }
+}
+
+// Calls an OpenAI-compatible (/chat/completions) or Anthropic (/messages) endpoint.
+// Returns the raw text content of the model's reply (to be fed to scoreLLMResponse).
+export async function callLLM(cfg, prompt) {
+  const provider = cfg.provider || 'openai'
+  const base = (cfg.baseUrl || API_DEFAULT_BASE[provider] || '').trim().replace(/\/+$/, '')
+  if (!base) throw new Error('Missing base URL')
+  if (!cfg.apiKey) throw new Error('Missing API key / token')
+  if (!cfg.model) throw new Error('Missing model name')
+
+  if (provider === 'anthropic') {
+    const res = await fetch(base + '/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': cfg.apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({ model: cfg.model, max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text()).slice(0, 400)}`)
+    const data = await res.json()
+    return (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim()
+  }
+
+  // OpenAI-compatible (OpenAI, Azure-style gateways, OpenRouter, LiteLLM, vLLM, Ollama, …)
+  const res = await fetch(base + '/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.apiKey}` },
+    body: JSON.stringify({
+      model: cfg.model,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'You are a rail operations controller. Respond with ONLY the requested JSON.' },
+        { role: 'user', content: prompt },
+      ],
+    }),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text()).slice(0, 400)}`)
+  const data = await res.json()
+  const msg = data.choices && data.choices[0] && data.choices[0].message
+  return ((msg && (typeof msg.content === 'string' ? msg.content : (msg.content || []).map((c) => c.text || '').join('\n'))) || '').trim()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Root component
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -451,6 +508,13 @@ export default function App() {
   const [llmText, setLlmText] = useState('')
   const [scoreResult, setScoreResult] = useState(null)
   const [copied, setCopied] = useState(false)
+  const [apiCfg, setApiCfg] = useState(loadApiCfg)
+  const [apiState, setApiState] = useState({ running: false, error: '' })
+  const [runs, setRuns] = useState([])
+
+  useEffect(() => {
+    try { localStorage.setItem('trainbench_api', JSON.stringify(apiCfg)) } catch (e) { /* ignore */ }
+  }, [apiCfg])
 
   const scenario = gameState ? getScenario(gameState.scenarioId) : null
   const promptText = useMemo(
@@ -485,25 +549,55 @@ export default function App() {
   }
   function scoreResponse() { setScoreResult(scoreLLMResponse(llmText, scenario)) }
 
+  async function runOnModel() {
+    setApiState({ running: true, error: '' })
+    setScoreResult(null)
+    try {
+      const text = await callLLM(apiCfg, promptText)
+      setLlmText(text)
+      const result = scoreLLMResponse(text, scenario)
+      setScoreResult(result)
+      setRuns((rs) => [{ model: apiCfg.model || '(model)', total: result.total, grade: result.grade, scenario: scenario.id, at: Date.now() }, ...rs].slice(0, 15))
+      setApiState({ running: false, error: '' })
+    } catch (e) {
+      const msg = String((e && e.message) || e)
+      const hint = /Failed to fetch|NetworkError|CORS/i.test(msg)
+        ? ' — likely CORS/network. The endpoint must allow browser (cross-origin) calls; many gateways do, api.openai.com does not.'
+        : ''
+      setApiState({ running: false, error: msg + hint })
+    }
+  }
+
   if (screen === 'home') return <Home mode={mode} setMode={setMode} onStart={startScenario} />
 
   return (
-    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: C.bg, color: C.body, fontFamily: FONT, overflow: 'hidden' }}>
-      <Header scenario={scenario} gameState={gameState} mode={mode} setMode={setMode} onBack={backHome} />
-      <ScoreBar score={gameState.score} />
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        <div style={{ width: 290, flexShrink: 0, borderRight: `1px solid ${C.border}`, overflowY: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <Schematic platforms={gameState.platforms} trains={gameState.trains} />
+    <div style={{ minHeight: '100vh', background: C.bg, color: C.body, fontFamily: FONT }}>
+      <div style={{ position: 'sticky', top: 0, zIndex: 20 }}>
+        <Header scenario={scenario} gameState={gameState} mode={mode} setMode={setMode} onBack={backHome} />
+        <ScoreBar score={gameState.score} />
+      </div>
+
+      <TrackYard
+        state={gameState} scenario={scenario} platforms={gameState.platforms} trains={gameState.trains}
+        mode={mode} sel={sel} onPickTrain={chooseTrain} onPickPlatform={choosePlatform}
+        onAdvance={advance} ended={gameState.ended}
+      />
+
+      {mode === 'BENCHMARK' && (
+        <BenchmarkPanel
+          promptText={promptText} copied={copied} onCopy={copyPrompt}
+          llmText={llmText} setLlmText={setLlmText} onScore={scoreResponse} scoreResult={scoreResult}
+          apiCfg={apiCfg} setApiCfg={setApiCfg} apiState={apiState} onRun={runOnModel} runs={runs}
+        />
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <div style={{ width: 300, flexShrink: 0, padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {mode === 'PLAY' && <ControlPanel sel={sel} onAction={chooseAction} onExecute={execute} />}
           <PlatformList platforms={gameState.platforms} trains={gameState.trains} mode={mode} sel={sel} onPick={choosePlatform} />
-          {mode === 'PLAY' && (
-            <ControlPanel sel={sel} trains={gameState.trains} ended={gameState.ended} onAction={chooseAction} onExecute={execute} onAdvance={advance} />
-          )}
         </div>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflowY: 'auto' }}>
+        <div style={{ flex: 1, minWidth: 320, display: 'flex', flexDirection: 'column' }}>
           <TrainTable trains={gameState.trains} platforms={gameState.platforms} mode={mode} sel={sel} onPick={chooseTrain} />
-          {mode === 'BENCHMARK' && (
-            <BenchmarkPanel promptText={promptText} copied={copied} onCopy={copyPrompt} llmText={llmText} setLlmText={setLlmText} onScore={scoreResponse} scoreResult={scoreResult} />
-          )}
           <EventLog log={gameState.log} />
         </div>
       </div>
@@ -636,49 +730,181 @@ function ScoreBar({ score }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Station schematic (SVG)
+// Live track yard — the visual centerpiece. SVG rails/throats + HTML train cards
+// that animate between approach → platform → departure as the game ticks.
 // ─────────────────────────────────────────────────────────────────────────────
-function Schematic({ platforms, trains }) {
-  const W = 266, rowH = 46, top = 44, boxX = 52, boxW = W - boxX - 6, boxH = 34
-  const H = top + platforms.length * rowH + 6
-  const spineY = 22
-  const throatBottom = top + (platforms.length - 1) * rowH + boxH / 2
+function platStatusColor(p) {
+  return p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.dim
+}
+
+function TrackYard({ state, scenario, platforms, trains, mode, sel, onPickTrain, onPickPlatform, onAdvance, ended }) {
+  const n = platforms.length
+  const VW = 1000
+  const topPad = 56, trackGap = 64, botPad = 30
+  const H = topPad + n * trackGap + botPad
+  const yFor = (i) => topPad + i * trackGap
+  const X = { stage: 78, appStart: 168, platL: 372, island: 520, platR: 700, depart: 936 }
+  const yMid = topPad + (n * trackGap) / 2 - trackGap / 2
+  const idx = {}
+  platforms.forEach((p, i) => { idx[p.id] = i })
+  const pct = (x) => `${(x / VW) * 100}%`
+
+  const assignActive = mode === 'PLAY' && sel.action === 'ASSIGN'
+  const trainClickable = mode === 'PLAY' && !!sel.action
+
+  // Trains waiting for a platform (and not-yet-arrived) queue in the approach yard.
+  const holding = trains
+    .filter((t) => t.status === 'SCHEDULED' || (t.status === 'APPROACHING' && !t.platId))
+    .sort((a, b) => (a.arr ?? 1e9) - (b.arr ?? 1e9))
+  const holdSlot = {}
+  holding.forEach((t, k) => { holdSlot[t.id] = k })
+  const holdY = (k) => topPad + 4 + k * 50
+
+  function target(t) {
+    if (t.status === 'DEPARTED') {
+      const i = t.platId != null && idx[t.platId] != null ? idx[t.platId] : Math.floor(n / 2)
+      return { x: X.depart, y: yFor(i), op: 0.3 }
+    }
+    if (t.status === 'AT_PLATFORM') return { x: X.island, y: yFor(idx[t.platId] ?? 0), op: 1 }
+    if (t.status === 'APPROACHING' && t.platId != null && idx[t.platId] != null) {
+      const arrAt = (t.arr ?? state.time) + t.delay
+      const prog = Math.max(0, Math.min(1, (state.time - (arrAt - 6)) / 6))
+      return { x: X.appStart + (X.platL - X.appStart) * prog, y: yFor(idx[t.platId]), op: 1 }
+    }
+    const k = holdSlot[t.id] ?? 0
+    return { x: X.stage, y: holdY(k), op: t.status === 'SCHEDULED' ? 0.55 : 1 }
+  }
+
   return (
-    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 8 }}>
-      <div style={sectionTitle}>STATION SCHEMATIC</div>
-      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block' }}>
-        <line x1={10} y1={spineY} x2={W - 10} y2={spineY} stroke={C.dim} strokeWidth={2} />
-        <text x={12} y={spineY - 6} fill={C.dim} fontSize={8} fontFamily={FONT}>APPROACH ▸</text>
-        <text x={W - 10} y={spineY - 6} fill={C.dim} fontSize={8} fontFamily={FONT} textAnchor="end">▸ DEPART</text>
-        <line x1={30} y1={spineY} x2={30} y2={throatBottom} stroke={C.dim} strokeWidth={1.2} strokeDasharray="3 3" />
-        {platforms.map((p, i) => {
-          const y = top + i * rowH, cy = y + boxH / 2
-          const border = p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.border
-          const tr = p.trainId ? trains.find((t) => t.id === p.trainId) : null
-          const tcol = tr ? TRAIN_TYPE_COLORS[tr.type] : C.dim
-          return (
-            <g key={p.id}>
-              <line x1={30} y1={cy} x2={boxX} y2={cy} stroke={C.dim} strokeWidth={1.2} strokeDasharray="3 3" />
-              <rect x={boxX} y={y} width={boxW} height={boxH} rx={4} fill={C.panel} stroke={border} strokeWidth={1.5} />
-              <text x={boxX + 7} y={y + 14} fill={C.bright} fontSize={11} fontWeight="bold" fontFamily={FONT}>{p.label}</text>
-              <text x={boxX + 7} y={y + 26} fill={C.muted} fontSize={8} fontFamily={FONT}>
-                {(p.full ? 'FULL' : 'SHORT') + (p.elec ? ' ⚡' : '') + (p.sigFail ? ' ⚠' : '')}
-              </text>
-              {tr ? (
-                <g>
-                  <rect x={boxX + 62} y={y + 5} width={boxW - 68} height={boxH - 10} rx={3} fill={tcol + '22'} stroke={tcol} strokeWidth={1} />
-                  <text x={boxX + 68} y={y + 15} fill={tcol} fontSize={9} fontWeight="bold" fontFamily={FONT}>
-                    {tr.id}{tr.delay > 0 ? ` +${tr.delay}` : ''}
-                  </text>
-                  <text x={boxX + 68} y={y + 26} fill={C.muted} fontSize={7.5} fontFamily={FONT}>{tr.blocked ? 'BLOCKED' : tr.status}</text>
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, margin: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+        <span style={{ ...sectionTitle, margin: 0 }}>● LIVE TRACK YARD</span>
+        <span style={{ fontSize: 10, color: C.dim }}>◀ approach &nbsp;·&nbsp; platforms &nbsp;·&nbsp; departure ▶</span>
+        <div style={{ flex: 1 }} />
+        {trainClickable && <span style={{ fontSize: 10, color: C.blue }}>▸ click a {assignActive ? 'train, then a platform' : 'train'} below</span>}
+        <span style={{ fontSize: 11, color: C.muted, fontVariantNumeric: 'tabular-nums' }}>{formatTime(state.time)} · T+{state.elapsed}/{scenario.duration}</span>
+        <button onClick={onAdvance} disabled={ended} style={{
+          ...btn(ended ? C.border : C.blue, ended ? C.dim : '#fff'),
+          background: ended ? C.panel : C.blue, fontWeight: 'bold', cursor: ended ? 'not-allowed' : 'pointer',
+        }}>{ended ? '■ ENDED' : '⏭ ADVANCE 1 MIN'}</button>
+      </div>
+
+      <div style={{ overflowX: 'auto' }}>
+        <div style={{ position: 'relative', minWidth: 760, height: H }}>
+          {/* rails, throats, sleepers */}
+          <svg viewBox={`0 0 ${VW} ${H}`} width="100%" height={H} preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, display: 'block' }}>
+            <rect x={0} y={topPad - 14} width={X.appStart - 6} height={H - topPad - 6} fill={C.bg} opacity={0.5} rx={6} />
+            <rect x={X.depart - 8} y={topPad - 14} width={VW - X.depart + 6} height={H - topPad - 6} fill={C.bg} opacity={0.5} rx={6} />
+            {platforms.map((p, i) => {
+              const y = yFor(i)
+              const sc = platStatusColor(p)
+              return (
+                <g key={p.id}>
+                  {/* approach + departure throats */}
+                  <line x1={X.appStart} y1={yMid} x2={X.platL} y2={y} stroke={C.border} strokeWidth={1.4} strokeDasharray="4 4" />
+                  <line x1={X.platR} y1={y} x2={X.depart} y2={yMid} stroke={C.border} strokeWidth={1.4} strokeDasharray="4 4" />
+                  {/* twin rails across the platform road */}
+                  <line x1={X.appStart} y1={y - 3} x2={X.depart} y2={y - 3} stroke={C.dim} strokeWidth={1.4} />
+                  <line x1={X.appStart} y1={y + 3} x2={X.depart} y2={y + 3} stroke={C.dim} strokeWidth={1.4} />
+                  {/* sleepers along the platform segment */}
+                  {Array.from({ length: 9 }).map((_, k) => {
+                    const sx = X.platL + ((X.platR - X.platL) / 8) * k
+                    return <line key={k} x1={sx} y1={y - 5} x2={sx} y2={y + 5} stroke={C.border} strokeWidth={1} />
+                  })}
+                  {/* platform island slab */}
+                  <rect x={X.platL} y={y + 9} width={X.platR - X.platL} height={16} rx={3} fill={sc + '22'} stroke={sc} strokeWidth={1} />
                 </g>
-              ) : (
-                <text x={boxX + boxW - 8} y={cy + 3} fill={C.dim} fontSize={9} fontFamily={FONT} textAnchor="end">— free —</text>
-              )}
-            </g>
-          )
-        })}
-      </svg>
+              )
+            })}
+          </svg>
+
+          {/* zone labels */}
+          <div style={{ position: 'absolute', left: pct(X.stage), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim, whiteSpace: 'nowrap' }}>◀ APPROACH</div>
+          <div style={{ position: 'absolute', left: pct(X.island), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim }}>PLATFORMS</div>
+          <div style={{ position: 'absolute', left: pct(X.depart), top: topPad - 30, transform: 'translateX(-50%)', fontSize: 9, color: C.dim }}>DEPARTURE ▶</div>
+
+          {/* platform island labels + signals (HTML overlay, clickable to assign) */}
+          {platforms.map((p, i) => {
+            const sc = platStatusColor(p)
+            const isTarget = sel.platform === p.id
+            const sigColor = p.sigFail ? C.red : p.status === 'OCCUPIED' ? C.green : p.status === 'RESERVED' ? C.yellow : C.green
+            return (
+              <React.Fragment key={p.id}>
+                <div
+                  onClick={() => assignActive && onPickPlatform(p.id)}
+                  title={`Platform ${p.label}`}
+                  style={{
+                    position: 'absolute', left: pct(X.platL), width: pct(X.platR - X.platL), top: yFor(i) + 26,
+                    boxSizing: 'border-box', padding: '2px 7px', borderRadius: 5,
+                    border: `1px solid ${isTarget ? C.blue : 'transparent'}`,
+                    background: isTarget ? C.blue + '22' : 'transparent',
+                    cursor: assignActive ? 'pointer' : 'default',
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6,
+                  }}>
+                  <span style={{ color: C.bright, fontWeight: 'bold', fontSize: 11, whiteSpace: 'nowrap' }}>{p.label}</span>
+                  <span style={{ color: C.muted, fontSize: 9, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {p.full ? 'FULL' : 'SHORT'}{p.elec ? ' ⚡' : ''}{p.sigFail ? ' ⚠' : ''}
+                  </span>
+                </div>
+                {/* departure signal light */}
+                <div style={{ position: 'absolute', left: pct(X.platR + 14), top: yFor(i) - 6, transform: 'translateX(-50%)', width: 11, height: 11, borderRadius: '50%', background: sigColor, boxShadow: `0 0 6px ${sigColor}`, border: `1px solid ${C.bg}` }} />
+              </React.Fragment>
+            )
+          })}
+
+          {/* trains */}
+          {trains.map((t) => {
+            const tp = target(t)
+            const tcol = TRAIN_TYPE_COLORS[t.type]
+            const onSigPlat = t.platId && platforms.find((p) => p.id === t.platId)?.sigFail
+            const isSel = sel.train === t.id
+            const border = isSel ? C.blue : t.blocked ? C.red : tcol
+            const subtitle = t.blocked ? '🔒 BLOCKED' : t.status === 'DEPARTED' ? '✓ departed' : `${t.pax}p · P${t.priority}`
+            return (
+              <div key={t.id}
+                onClick={() => trainClickable && onPickTrain(t.id)}
+                style={{
+                  position: 'absolute', left: pct(tp.x), top: tp.y, width: 138, height: 44,
+                  transform: 'translate(-50%, -50%)', transition: 'left .6s ease, top .6s ease, opacity .5s ease',
+                  opacity: tp.op, cursor: trainClickable ? 'pointer' : 'default', zIndex: t.status === 'AT_PLATFORM' ? 6 : 5,
+                }}>
+                <div style={{
+                  display: 'flex', height: '100%', background: C.panel, border: `2px solid ${border}`,
+                  borderRadius: '7px 13px 13px 7px', overflow: 'hidden',
+                  boxShadow: isSel ? `0 0 0 3px ${C.blue}55` : '0 2px 4px #0007',
+                }}>
+                  <div style={{ width: 6, background: tcol, flexShrink: 0 }} />
+                  <div style={{ flex: 1, padding: '3px 6px', minWidth: 0 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
+                      <span style={{ color: C.bright, fontWeight: 'bold', fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.id}</span>
+                      {t.delay > 0 && <span style={{ color: '#1a1200', background: C.yellow, borderRadius: 5, fontSize: 8, padding: '0 4px', fontWeight: 'bold', flexShrink: 0 }}>+{t.delay}</span>}
+                    </div>
+                    <div style={{ color: t.blocked ? C.red : C.muted, fontSize: 8.5, fontWeight: t.blocked ? 'bold' : 'normal', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{subtitle}</div>
+                  </div>
+                  <div style={{ width: 22, background: tcol + '2e', borderLeft: `1px solid ${tcol}`, display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative', flexShrink: 0 }}>
+                    <div style={{ width: 9, height: 8, background: C.bg, borderRadius: 2, border: `1px solid ${tcol}` }} />
+                    {onSigPlat && <span style={{ position: 'absolute', top: -1, right: 0, fontSize: 9 }}>⚠</span>}
+                  </div>
+                </div>
+                <div style={{ position: 'absolute', bottom: -3, left: 16, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
+                <div style={{ position: 'absolute', bottom: -3, right: 26, width: 7, height: 7, borderRadius: '50%', background: C.dim }} />
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* legend */}
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.border}`, fontSize: 10, color: C.muted }}>
+        {Object.entries(TRAIN_TYPE_COLORS).map(([k, v]) => (
+          <span key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+            <span style={{ width: 10, height: 10, background: v, borderRadius: 2, display: 'inline-block' }} />{k.replace('_', ' ')}
+          </span>
+        ))}
+        <span style={{ flex: 1 }} />
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.green, display: 'inline-block' }} />clear</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><span style={{ width: 10, height: 10, borderRadius: '50%', background: C.red, display: 'inline-block' }} />signal down</span>
+      </div>
     </div>
   )
 }
@@ -728,7 +954,7 @@ function PlatformList({ platforms, trains, mode, sel, onPick }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Control panel (PLAY mode)
 // ─────────────────────────────────────────────────────────────────────────────
-function ControlPanel({ sel, trains, ended, onAction, onExecute, onAdvance }) {
+function ControlPanel({ sel, onAction, onExecute }) {
   const canExec = sel.action && sel.train && (sel.action !== 'ASSIGN' || sel.platform)
   const actBtn = (a, label, color) => (
     <button onClick={() => onAction(a)} style={{
@@ -756,11 +982,10 @@ function ControlPanel({ sel, trains, ended, onAction, onExecute, onAdvance }) {
           ✓ EXECUTE {sel.action}
         </button>
       )}
-      <div style={{ height: 1, background: C.border, margin: '12px 0' }} />
-      <button onClick={onAdvance} disabled={ended} style={{
-        ...btn(ended ? C.border : C.blue, ended ? C.dim : '#fff'),
-        background: ended ? C.panel : C.blue, width: '100%', fontWeight: 'bold', fontSize: 13, cursor: ended ? 'not-allowed' : 'pointer',
-      }}>{ended ? '■ SCENARIO ENDED' : '⏭ ADVANCE 1 MINUTE'}</button>
+      <div style={{ marginTop: 10, fontSize: 10, color: C.dim, lineHeight: 1.5 }}>
+        Select an action, click a train in the yard (and a platform for assign), then EXECUTE.
+        Advance time with ⏭ in the yard toolbar above.
+      </div>
     </div>
   )
 }
@@ -814,10 +1039,56 @@ function TrainTable({ trains, platforms, mode, sel, onPick }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Benchmark panel + score result
 // ─────────────────────────────────────────────────────────────────────────────
-function BenchmarkPanel({ promptText, copied, onCopy, llmText, setLlmText, onScore, scoreResult }) {
+function BenchmarkPanel({ promptText, copied, onCopy, llmText, setLlmText, onScore, scoreResult, apiCfg, setApiCfg, apiState, onRun, runs }) {
   const ta = { width: '100%', boxSizing: 'border-box', resize: 'vertical', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, fontFamily: FONT, lineHeight: 1.4, padding: 8 }
+  const inp = { boxSizing: 'border-box', background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, color: C.bright, fontFamily: FONT, fontSize: 11, padding: '7px 8px', width: '100%' }
+  const set = (k) => (e) => setApiCfg({ ...apiCfg, [k]: e.target.value })
+  const defBase = API_DEFAULT_BASE[apiCfg.provider] || ''
   return (
-    <div style={{ margin: '0 12px 12px', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+    <div style={{ margin: '0 12px 12px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Live model runner */}
+      <div style={{ background: C.card, border: `1px solid ${C.purple}66`, borderRadius: 8, padding: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+          <span style={{ color: C.purple, fontWeight: 'bold', fontSize: 13 }}>🤖 RUN ON A LIVE MODEL</span>
+          <span style={{ fontSize: 10, color: C.dim }}>calls your endpoint from the browser and scores the reply automatically</span>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(140px,170px) 1fr 1fr', gap: 8, marginBottom: 8 }}>
+          <select value={apiCfg.provider} onChange={set('provider')} style={{ ...inp, cursor: 'pointer' }}>
+            <option value="openai">OpenAI-compatible</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+          <input value={apiCfg.baseUrl} onChange={set('baseUrl')} placeholder={`Base URL — default ${defBase}`} style={inp} />
+          <input value={apiCfg.model} onChange={set('model')} placeholder="Model id (e.g. gpt-4o-mini, claude-sonnet-4-5, llama-3.3-70b)" style={inp} />
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <input value={apiCfg.apiKey} onChange={set('apiKey')} type="password" placeholder="API key / token" style={{ ...inp, flex: '1 1 240px', width: 'auto' }} />
+          <button onClick={onRun} disabled={apiState.running} style={{ ...btn(C.purple, '#fff'), background: apiState.running ? C.panel : C.purple, fontWeight: 'bold', minWidth: 160, cursor: apiState.running ? 'wait' : 'pointer' }}>
+            {apiState.running ? '⏳ RUNNING…' : '▶ RUN & SCORE'}
+          </button>
+        </div>
+        {apiState.error && (
+          <div style={{ marginTop: 8, fontSize: 11, color: C.red, background: C.red + '14', border: `1px solid ${C.red}55`, borderRadius: 6, padding: '7px 9px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>⚠ {apiState.error}</div>
+        )}
+        <div style={{ marginTop: 8, fontSize: 9.5, color: C.dim }}>API key is stored only in this browser (localStorage). The endpoint must permit cross-origin (CORS) browser requests.</div>
+        {runs.length > 0 && (
+          <div style={{ marginTop: 10, borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+            <div style={{ fontSize: 10, color: C.muted, marginBottom: 5 }}>RUN HISTORY · this session</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {runs.map((r, i) => (
+                <div key={i} style={{ display: 'flex', gap: 10, fontSize: 11, alignItems: 'center' }}>
+                  <span style={{ color: gradeColor(r.grade), fontWeight: 'bold', width: 16 }}>{r.grade}</span>
+                  <span style={{ color: C.bright, width: 38, fontVariantNumeric: 'tabular-nums' }}>{r.total}/100</span>
+                  <span style={{ color: C.dim, width: 38 }}>{r.scenario}</span>
+                  <span style={{ color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.model}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Prompt + manual response */}
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
       <div style={{ flex: '1 1 380px', minWidth: 280, background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <span style={{ color: C.purple, fontWeight: 'bold', fontSize: 12 }}>① GENERATED PROMPT</span>
@@ -832,6 +1103,7 @@ function BenchmarkPanel({ promptText, copied, onCopy, llmText, setLlmText, onSco
         </div>
         <textarea value={llmText} onChange={(e) => setLlmText(e.target.value)} placeholder="Paste the model's JSON response here…" style={{ ...ta, color: C.bright, height: scoreResult ? 130 : 320, fontSize: 11 }} />
         {scoreResult && <ScoreResult r={scoreResult} />}
+      </div>
       </div>
     </div>
   )
